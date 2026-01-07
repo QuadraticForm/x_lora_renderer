@@ -2,6 +2,7 @@ import bpy
 import os
 import re
 from bpy.types import Operator, Panel
+from bpy.props import StringProperty
 
 # -------------------------
 # Helpers
@@ -20,9 +21,7 @@ def sanitize_filename(name: str) -> str:
     name = name.strip().strip(".")
     return name or "untitled"
 
-def resolve_output_dir(scene: bpy.types.Scene) -> str:
-    p = (scene.render.filepath or "").strip()
-
+def resolve_output_dir(p:str) -> str:
     # fallback: blend directory
     base = bpy.path.abspath("//")
 
@@ -71,6 +70,14 @@ def safe_format(template: str, ctx: dict) -> str:
     except Exception as e:
         return f"[FORMAT ERROR: {e}]"
 
+def clean_caption(s: str) -> str:
+    parts = [p.strip() for p in s.split(",")]
+    parts = [p for p in parts if p]  # drop empty tokens
+    return ", ".join(parts)
+
+def safe_format_caption(template: str, ctx: dict) -> str:
+    return clean_caption(safe_format(template, ctx))
+
 def pick_preview_camera(context) -> bpy.types.Object | None:
     """Prefer selected camera, else scene camera, else first camera in scene."""
     scene = context.scene
@@ -85,6 +92,21 @@ def pick_preview_camera(context) -> bpy.types.Object | None:
     cams = [o for o in scene.objects if o.type == "CAMERA"]
     return cams[0] if cams else None
 
+def collect_visible_cameras(scene: bpy.types.Scene, view_layer: bpy.types.ViewLayer) -> list[bpy.types.Object]:
+    """Collect cameras that are visible in the given view layer."""
+    return [
+        obj for obj in scene.objects
+        if obj.type == 'CAMERA'
+        and obj.name in view_layer.objects              # Not excluded from current View Layer
+        and obj.visible_get(view_layer=view_layer)      # Visible in current View Layer
+        and not obj.hide_render                         # (Optional) Not disabled for rendering
+    ]
+
+def collect_current_visible_cameras() -> list[bpy.types.Object]:
+    scene = bpy.context.scene
+    view_layer = bpy.context.view_layer
+    return collect_visible_cameras(scene, view_layer)
+
 # -------------------------
 # Operators
 # -------------------------
@@ -96,9 +118,10 @@ class XLR_OT_GenerateCaptions(Operator):
 
     def execute(self, context):
         scene = context.scene
-        out_dir = resolve_output_dir(scene)
+        out_dir = resolve_output_dir(scene.render.filepath)
 
-        cams = [obj for obj in scene.objects if obj.type == 'CAMERA']
+        cams = collect_visible_cameras(scene, context.view_layer)
+
         if not cams:
             self.report({'WARNING'}, "No cameras found")
             return {'CANCELLED'}
@@ -114,7 +137,7 @@ class XLR_OT_GenerateCaptions(Operator):
                 filename = sanitize_filename(raw_name)
 
                 tagpath = os.path.join(out_dir, f"{filename}.txt")
-                caption = safe_format(scene.xlr_caption_template, ctx)
+                caption = safe_format_caption(scene.xlr_caption_template, ctx)
 
                 with safe_open_file(tagpath, 'w', encoding='utf-8') as f:
                     f.write(caption)
@@ -139,15 +162,23 @@ class XLR_OT_RenderAllCameras(Operator):
         self.original_render_filepath = ""
         self._timer = None
 
-        scene = context.scene
-        self.original_camera = scene.camera
-        self.original_render_filepath = resolve_output_dir(scene)
+        self.scene = context.scene
+        self.view_layer = context.view_layer
+        self.override_context = context.copy()
 
-        # Collect all cameras
-        self.cameras = [obj for obj in scene.objects if obj.type == 'CAMERA']
+        scene = context.scene
+        view_layer = context.view_layer  # 或 bpy.context.view_layer
+
+        self.original_camera = scene.camera
+        self.original_render_filepath = scene.render.filepath
+
+        # 只收集当前 view layer 里“可见/生效”的相机
+        self.cameras = collect_visible_cameras(scene, view_layer)
+
         if not self.cameras:
-            self.report({'WARNING'}, "No cameras found")
+            self.report({'WARNING'}, "No visible cameras found in current View Layer")
             return {'CANCELLED'}
+
 
         scene.frame_set(scene.frame_start)
 
@@ -157,20 +188,29 @@ class XLR_OT_RenderAllCameras(Operator):
 
         return {'RUNNING_MODAL'}
 
-    def step(self, context):
-        scene = context.scene
+    def step(self, context : bpy.types.Context):
+
+        scene = self.scene
         camera = self.cameras[self.current_camera_index]
+
+        print(f"Rendering frame {scene.frame_current}, camera '{camera.name}'")
 
         ctx = make_format_context(scene, camera)
         raw_name = safe_format(scene.xlr_filename_template.strip(), ctx)
         filename = sanitize_filename(raw_name)
 
         # render.filepath is base path (no ext); blender adds extension
-        filepath = os.path.join(self.original_render_filepath, filename)
+        
+        filepath = os.path.join(resolve_output_dir(self.original_render_filepath), filename)
 
         scene.camera = camera
         scene.render.filepath = filepath
-        bpy.ops.render.render(write_still=True)
+        scene.render.use_sequencer = False  # ensure not rendering VSE
+        scene.frame_set(scene.frame_current)
+
+        context.temp_override(**self.override_context)
+
+        bpy.ops.render.render('EXEC_DEFAULT', write_still=True, use_viewport=False)
 
         # next camera / next frame
         self.current_camera_index += 1
@@ -242,7 +282,7 @@ class XLR_PT_FilePanel(Panel):
         box = layout.box()
 
         box.prop(scene.render, "filepath")
-        box.label(text=f"Resolved Path: {resolve_output_dir(scene)}", icon='INFO')
+        box.label(text=f"Resolved Path: {resolve_output_dir(scene.render.filepath)}", icon='INFO')
 
         layout.separator()
 
@@ -285,7 +325,7 @@ class XLR_PT_CaptionPanel(Panel):
         ctx = make_format_context(scene, cam) if cam else {
             "cam": "Camera", "frame": scene.frame_current, "tag": "", "marker": ""
         }
-        preview = safe_format(scene.xlr_caption_template, ctx)
+        preview = safe_format_caption(scene.xlr_caption_template, ctx)
 
         box.label(text=f"Preview: {preview}", icon='INFO')
 
@@ -344,15 +384,46 @@ class XLR_PT_RenderPanel(Panel):
             layout.prop(scene, "render_progress", slider=True)
 
 
+# -------------------------
+# Object["tag"] wrapper
+# -------------------------
+def _get_tag(obj):
+    # 没有属性就返回空串（用于可编辑输入框）
+    return obj.get("tag", "")
+
+def _set_tag(obj, value):
+    # 一编辑就写入自定义属性（自动创建）
+    obj["tag"] = value
+
+
 class XLR_PT_UtilitiesPanel(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "XLR"
-    bl_label = "Utilities"
+    bl_label = "Tag"
 
     def draw(self, context):
         layout = self.layout
+        obj = context.view_layer.objects.active
+
+        box = layout.box()
+
+        # 标题：Selected Camera + 当前相机名
+        cam_name = obj.name if (obj and obj.type == "CAMERA") else "NONE"
+        box.label(text=f"Selected Camera: {cam_name}")
+
+        if not obj or obj.type != "CAMERA":
+            box.label(text="No camera selected")
+        else:
+            # 编辑框（永远可编辑；空串代表还没设置）
+            row = box.row(align=True)
+            row.label(text="Tag:")
+            row.prop(obj, "xlr_tag", text="")
+
+        # 把 Add Tag 按钮放到 box 下面
         layout.operator(XLR_OT_AddTagProperty.bl_idname)
+
+
 
 # -------------------------
 # Register (your system auto-registers classes; we only register props)
@@ -375,10 +446,18 @@ def register():
         description="Python format string for .txt. Fields: cam, frame, tag, marker. Example: {tag} {marker}"
     )
 
+    bpy.types.Object.xlr_tag = StringProperty(
+        name="Tag",
+        description='Stored in Object["tag"]',
+        get=_get_tag,
+        set=_set_tag,
+    )
+
 def unregister():
     del bpy.types.Scene.render_progress
     del bpy.types.Scene.xlr_filename_template
     del bpy.types.Scene.xlr_caption_template
+    del bpy.types.Object.xlr_tag
 
 if __name__ == "__main__":
     register()
