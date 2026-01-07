@@ -1,6 +1,6 @@
 bl_info = {
-    "name": "HabbyAutoRenderer",
-    "author": "xuxing @ Habby",
+    "name": "x_lora_renderer",
+    "author": "xuxing",
     "blender": (4, 0, 0),
     "version": (0, 0, 1),
     "location": "View3D > Sidebar",
