@@ -164,7 +164,6 @@ class XLR_OT_RenderAllCameras(Operator):
 
         self.scene = context.scene
         self.view_layer = context.view_layer
-        self.override_context = context.copy()
 
         scene = context.scene
         view_layer = context.view_layer  # 或 bpy.context.view_layer
@@ -205,12 +204,10 @@ class XLR_OT_RenderAllCameras(Operator):
 
         scene.camera = camera
         scene.render.filepath = filepath
-        scene.render.use_sequencer = False  # ensure not rendering VSE
-        scene.frame_set(scene.frame_current)
 
-        context.temp_override(**self.override_context)
-
-        bpy.ops.render.render('EXEC_DEFAULT', write_still=True, use_viewport=False)
+        # !!!!!! MUST use 'INVOKE_DEFAULT' otherwise camera change won't take effect !!!!!
+        # !!!!!! WHY??? Blender API is weird sometimes !!!!!!
+        bpy.ops.render.render('INVOKE_DEFAULT', write_still=True, use_viewport=False)
 
         # next camera / next frame
         self.current_camera_index += 1
