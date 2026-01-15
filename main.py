@@ -11,6 +11,12 @@ from bpy.props import (
     FloatProperty,
 )
 
+import tempfile
+import uuid
+from math import pi
+from mathutils import Vector, Euler
+
+
 # =========================================================
 # Constants
 # =========================================================
@@ -87,50 +93,63 @@ def _get_marker_name(scene, frame: int) -> str:
     return ""
 
 
-def _get_active_env_name(scene) -> str:
+def _get_active_env_item(scene):
     items = getattr(scene, "xlr_envs", None)
     if not items:
-        return ""
+        return None
     idx = getattr(scene, "xlr_envs_index", -1)
     if not (0 <= idx < len(items)):
+        return None
+    return items[idx]
+
+
+def _get_active_env_name(scene) -> str:
+    it = _get_active_env_item(scene)
+    if not it:
         return ""
-    it = items[idx]
-    if it.collection:
-        return it.collection.name
-    if it.world:
-        return it.world.name
-    return ""
+    return it.collection.name if it.collection else ""
+
+
+def _get_active_env_tag(scene) -> str:
+    it = _get_active_env_item(scene)
+    if not it:
+        return ""
+    return getattr(it, "tag", "") or ""
 
 
 def _make_format_context(scene, cam):
     frame = scene.frame_current
     marker = _get_marker_name(scene, frame)
+
     env = _get_active_env_name(scene)
+    env_tag = _get_active_env_tag(scene)
 
     if cam:
         return {
             "cam": cam.name,
             "frame": frame,
-            "tag": cam.get("tag", ""),
+            "cam_tag": cam.get("tag", ""),
             "marker": marker,
             "collection": _get_primary_collection_name(cam),
             "env": env,
+            "env_tag": env_tag,
         }
     else:
         return {
             "cam": "Camera",
             "frame": frame,
-            "tag": "",
+            "cam_tag": "",
             "marker": marker,
             "collection": "",
             "env": env,
+            "env_tag": env_tag,
         }
 
 
 def _make_rename_context(scene, cam, index: int):
     return {
         "cam": cam.name,
-        "tag": cam.get("tag", ""),
+        "cam_tag": cam.get("tag", ""),
         "collection": _get_primary_collection_name(cam),
         "index": index,
     }
@@ -173,6 +192,251 @@ def _rename_with_prefix(scene, cameras):
         prefix = _safe_format(scene.camera_rename_prefix.strip(), _make_rename_context(scene, cam, i))
         cam.name = f"{prefix}{i}"
     return len(cameras)
+
+
+# =========================================================
+# World Bake Helpers (NEW)
+# =========================================================
+
+def _remove_world_if_exists(name: str):
+    w = bpy.data.worlds.get(name)
+    if w:
+        try:
+            w.use_fake_user = False
+        except Exception:
+            pass
+        bpy.data.worlds.remove(w, do_unlink=True)
+
+
+def _remove_image_if_exists(name: str):
+    img = bpy.data.images.get(name)
+    if img:
+        try:
+            img.use_fake_user = False
+        except Exception:
+            pass
+        bpy.data.images.remove(img, do_unlink=True)
+
+
+def _disable_local_cameras_in_window(context):
+    """
+    Disable use_local_camera for all VIEW_3D spaces in current window/screen.
+    Returns a restore token list: [(space, prev_bool), ...]
+    """
+    token = []
+    win = getattr(context, "window", None)
+    scr = win.screen if win else None
+    if not scr:
+        return token
+
+    for area in scr.areas:
+        if area.type != "VIEW_3D":
+            continue
+        for space in area.spaces:
+            if space.type != "VIEW_3D":
+                continue
+            try:
+                prev = bool(space.use_local_camera)
+                token.append((space, prev))
+                if prev:
+                    space.use_local_camera = False
+            except Exception:
+                pass
+    return token
+
+
+def _restore_local_cameras(token):
+    for space, prev in token:
+        try:
+            space.use_local_camera = prev
+        except Exception:
+            pass
+
+
+def _snapshot_render_settings(scene):
+    r = scene.render
+    img = r.image_settings
+    cycles_samples = None
+    if hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
+        cycles_samples = scene.cycles.samples
+    return {
+        "camera": scene.camera,
+        "world": scene.world,
+        "engine": r.engine,
+        "filepath": r.filepath,
+        "res_x": r.resolution_x,
+        "res_y": r.resolution_y,
+        "res_pct": r.resolution_percentage,
+        "file_format": img.file_format,
+        "color_mode": img.color_mode,
+        "color_depth": img.color_depth,
+        "cycles_samples": cycles_samples,
+    }
+
+
+def _restore_render_settings(scene, snap):
+    r = scene.render
+    img = r.image_settings
+    scene.camera = snap["camera"]
+    scene.world = snap["world"]
+    r.engine = snap["engine"]
+    r.filepath = snap["filepath"]
+    r.resolution_x = snap["res_x"]
+    r.resolution_y = snap["res_y"]
+    r.resolution_percentage = snap["res_pct"]
+    img.file_format = snap["file_format"]
+    img.color_mode = snap["color_mode"]
+    img.color_depth = snap["color_depth"]
+    if snap["cycles_samples"] is not None and hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
+        scene.cycles.samples = snap["cycles_samples"]
+
+
+def _snapshot_collection_hide_render(scene):
+    state = {}
+    for col in scene.collection.children:
+        state[col.name_full] = bool(col.hide_render)
+    return state
+
+
+def _apply_collection_hide_render(scene, state, hide_all=True, keep_collection=None):
+    for col in scene.collection.children:
+        if keep_collection and col == keep_collection:
+            continue
+        if hide_all:
+            col.hide_render = True
+        else:
+            col.hide_render = state.get(col.name_full, False)
+
+
+def _bake_world_to_env_texture(
+    context,
+    * ,
+    resolution: int = 2048,
+    cycles_samples: int = 4,
+    file_format: str = "HDR",   # "HDR" / "OPEN_EXR" / "PNG"
+) -> tuple[bpy.types.Image | None, str | None]:
+    """
+    Render current scene.world into an equirectangular environment image via a temporary pano camera.
+    Returns: (loaded_image_datablock, tmp_file_path_or_None)
+    - Uses unique temp file path each time.
+    - Loads with check_existing=False to avoid Blender reusing datablock by filepath.
+    """
+    scene = context.scene
+
+    snap = _snapshot_render_settings(scene)
+
+    # Temp bake camera + collection
+    bake_camera_data = bpy.data.cameras.new(".XLR_BakeCamera")
+    bake_camera_data.type = "PANO"
+    if hasattr(bake_camera_data, "cycles"):
+        bake_camera_data.cycles.panorama_type = "EQUIRECTANGULAR"
+    else:
+        bake_camera_data.panorama_type = "EQUIRECTANGULAR"
+
+    bake_camera = bpy.data.objects.new(".XLR_BakeCamera", bake_camera_data)
+    bake_camera.location = Vector((0, 0, 0))
+    bake_camera.rotation_euler = Euler((pi / 2.0, 0, -pi / 2.0))
+
+    bake_coll = bpy.data.collections.new(".XLR_Bake")
+    scene.collection.children.link(bake_coll)
+    bake_coll.objects.link(bake_camera)
+
+    # Hide all top-level collections from render (keep bake collection)
+    hide_state = _snapshot_collection_hide_render(scene)
+    _apply_collection_hide_render(scene, hide_state, hide_all=True, keep_collection=bake_coll)
+
+    tmp_path = None
+    loaded_img = None
+
+    try:
+        # Configure render settings for bake
+        scene.render.engine = "CYCLES"
+        scene.camera = bake_camera
+
+        # 2:1 equirectangular size
+        scene.render.resolution_x = int(resolution)
+        scene.render.resolution_y = int(resolution // 2)
+        scene.render.resolution_percentage = 100
+
+        scene.render.image_settings.file_format = file_format
+        scene.render.image_settings.color_mode = "RGB"
+        if file_format in {"HDR", "OPEN_EXR"}:
+            scene.render.image_settings.color_depth = "32"
+        elif file_format == "PNG":
+            scene.render.image_settings.color_depth = "16"
+
+        if hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
+            scene.cycles.samples = int(cycles_samples)
+
+        # Render (blocking)
+        bpy.ops.render.render()
+
+        rr = bpy.data.images.get("Render Result")
+        if rr is None:
+            return None, None
+
+        # Unique temp file path (avoid overwrite + reuse)
+        ext = ".hdr"
+        if file_format == "OPEN_EXR":
+            ext = ".exr"
+        elif file_format == "PNG":
+            ext = ".png"
+
+        tmp_name = f"XLR_WorldBake_{uuid.uuid4().hex}{ext}"
+        tmp_path = os.path.join(tempfile.gettempdir(), tmp_name)
+
+        rr.save_render(filepath=tmp_path)
+
+        loaded_img = bpy.data.images.load(tmp_path, check_existing=False)
+
+    finally:
+        # Restore hide_render
+        _apply_collection_hide_render(scene, hide_state, hide_all=False)
+
+        # Cleanup bake objects / datablocks
+        try:
+            bpy.data.objects.remove(bake_camera, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            bpy.data.cameras.remove(bake_camera_data, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            bpy.data.collections.remove(bake_coll)
+        except Exception:
+            pass
+
+        # Restore render settings
+        _restore_render_settings(scene, snap)
+
+    return loaded_img, tmp_path
+
+
+def _build_baked_world(world_name: str, baked_img: bpy.types.Image):
+    w = bpy.data.worlds.new(world_name)
+    w.use_nodes = True
+    nt = w.node_tree
+    nodes = nt.nodes
+    links = nt.links
+
+    # Clear nodes
+    for n in list(nodes):
+        nodes.remove(n)
+
+    out = nodes.new("ShaderNodeOutputWorld")
+    out.location = (400, 0)
+
+    bg = nodes.new("ShaderNodeBackground")
+    bg.location = (150, 0)
+
+    env_tex = nodes.new("ShaderNodeTexEnvironment")
+    env_tex.location = (-200, 0)
+    env_tex.image = baked_img
+
+    links.new(env_tex.outputs["Color"], bg.inputs["Color"])
+    links.new(bg.outputs["Background"], out.inputs["Surface"])
+    return w
 
 
 # =========================================================
@@ -237,10 +501,6 @@ def _iter_enabled_env_indices(scene: bpy.types.Scene):
             continue
         if not it.collection:
             continue
-        # world is optional; but you said you want a paired world data.
-        # If you want to strictly require world, uncomment next lines:
-        # if not it.world:
-        #     continue
         out.append(i)
     return out
 
@@ -277,6 +537,7 @@ class XLR_EnvItem(PropertyGroup):
     use: BoolProperty(name="Use", default=True)
     collection: PointerProperty(name="Collection", type=bpy.types.Collection)
     world: PointerProperty(name="World", type=bpy.types.World)
+    tag: StringProperty(name="Tag", default="", description="Env tag used as {env_tag} replacement field.")
 
 
 class XLR_UL_CameraCollections(UIList):
@@ -296,7 +557,6 @@ class XLR_UL_Envs(UIList):
         row = layout.row(align=True)
         row.prop(item, "use", text="")
         row.label(text=(item.collection.name if item.collection else "<None>"), icon="OUTLINER_COLLECTION")
-        # row.label(text=(item.world.name if item.world else "<World?>"), icon="WORLD")
         ui_op(row, XLR_OT_RemoveEnvAt, text="", icon="X", index=index)
 
 
@@ -456,12 +716,9 @@ class XLR_OT_RenderAllCameras(Operator):
         # ensure current env is active
         self._ensure_env_active()
 
-        # current triple
-        env_idx = self.env_indices[self.env_i]  # unused directly; kept for clarity
         frame = self.frames[self.frame_i]
         cam = self.cameras[self.cam_i]
 
-        # set frame (we do it every step; cheap enough and avoids mismatch)
         scene.frame_set(frame)
 
         # build output
@@ -474,7 +731,7 @@ class XLR_OT_RenderAllCameras(Operator):
         scene.render.filepath = filepath
         bpy.ops.render.render("INVOKE_DEFAULT", write_still=True, use_viewport=False)
 
-        # advance: camera -> frame -> env   (env outer, frame middle, cam inner)
+        # advance: camera -> frame -> env
         self.cam_i += 1
         if self.cam_i >= len(self.cameras):
             self.cam_i = 0
@@ -602,6 +859,7 @@ class XLR_OT_AddEnv(Operator):
         item.use = True
         item.collection = active_coll
         item.world = scene.world  # convenient default
+        item.tag = ""             # default empty; user can set
 
         scene.xlr_envs_index = max(0, len(scene.xlr_envs) - 1)
         return {"FINISHED"}
@@ -701,6 +959,93 @@ class XLR_OT_RenameInActiveCollection(Operator):
         return {"FINISHED"}
 
 
+class XLR_OT_BakeActiveEnvWorld(Operator):
+    bl_idname = "xlr.env_bake_active_world"
+    bl_label = "Bake World to Texture (Active Env)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    bake_resolution: IntProperty(name="Resolution", default=2048, min=256, max=16384)
+    bake_samples: IntProperty(name="Cycles Samples", default=4, min=1, max=1024)
+
+    def execute(self, context):
+        scene = context.scene
+        view_layer = context.view_layer
+
+        idx = getattr(scene, "xlr_envs_index", -1)
+        if not (0 <= idx < len(scene.xlr_envs)):
+            self.report({"WARNING"}, "No env selected")
+            return {"CANCELLED"}
+
+        # 1) Bake 前先 activate 当前 env（避免歧义）
+        if not _activate_env(scene, view_layer, idx):
+            self.report({"WARNING"}, "Env activation failed (need collection)")
+            return {"CANCELLED"}
+
+        it = scene.xlr_envs[idx]
+        if not scene.world:
+            self.report({"WARNING"}, "Scene has no active world to bake")
+            return {"CANCELLED"}
+
+        env_name = _get_active_env_name(scene) or (it.collection.name if it.collection else "Env")
+        baked_name = f"{env_name}_world_baked"  # required naming
+
+        # 2) remove same-name datablocks first (short remove, do_unlink)
+        _remove_world_if_exists(baked_name)
+        _remove_image_if_exists(baked_name)
+
+        # 3) disable local cameras to avoid wrong render camera
+        local_cam_token = _disable_local_cameras_in_window(context)
+
+        img = None
+        tmp_path = None
+        try:
+            # 4) bake -> temp file -> load as new image datablock
+            img, tmp_path = _bake_world_to_env_texture(
+                context,
+                resolution=self.bake_resolution,
+                cycles_samples=self.bake_samples,
+                file_format="HDR",
+            )
+        finally:
+            _restore_local_cameras(local_cam_token)
+
+        if img is None:
+            self.report({"WARNING"}, "Bake failed (no image)")
+            return {"CANCELLED"}
+
+        # 5) rename image to stable baked name
+        img.name = baked_name
+
+        # 6) pack + clear filepath (avoid later “match by path”)
+        try:
+            img.pack()
+        except Exception:
+            pass
+        for attr in ("filepath", "filepath_raw"):
+            if hasattr(img, attr):
+                try:
+                    setattr(img, attr, "")
+                except Exception:
+                    pass
+
+        # delete temp file after pack
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        # 7) create baked world and wire nodes
+        baked_world = _build_baked_world(baked_name, img)
+
+        # 8) apply baked world to env item + scene
+        it.world = baked_world
+        scene.world = baked_world
+
+        self.report({"INFO"}, f"Baked world applied: {baked_world.name} (Image: {img.name})")
+        return {"FINISHED"}
+
+
 # =========================================================
 # Tag Property Wrapper (Object["tag"])
 # =========================================================
@@ -734,7 +1079,7 @@ class XLR_PT_FilePanel(Panel):
         box.prop(scene, "xlr_filename_template", text="Filename")
         hint = box.row()
         hint.enabled = False
-        hint.label(text="Fields: {cam} {frame} {tag} {marker} {collection} {env}")
+        hint.label(text="Fields: {cam} {frame} {cam_tag} {marker} {collection} {env} {env_tag}")
 
         cam = _pick_preview_camera(context)
         box.label(
@@ -758,7 +1103,7 @@ class XLR_PT_CaptionPanel(Panel):
 
         hint = box.row()
         hint.enabled = False
-        hint.label(text="Fields: {cam} {frame} {tag} {marker} {collection} {env}")
+        hint.label(text="Fields: {cam} {frame} {cam_tag} {marker} {collection} {env} {env_tag}")
 
         cam = _pick_preview_camera(context)
         box.label(
@@ -848,7 +1193,7 @@ class XLR_PT_CameraPanel(Panel):
         cam_name = obj.name if (obj and obj.type == "CAMERA") else "NONE"
         box.label(text=f"Selected Camera: {cam_name}")
         if obj and obj.type == "CAMERA":
-            box.prop(obj, "xlr_tag", text="Tag")
+            box.prop(obj, "xlr_tag", text="Tag")  # still edits Object["tag"]
         else:
             box.label(text="No camera selected")
 
@@ -860,7 +1205,7 @@ class XLR_PT_CameraPanel(Panel):
 
         hint = box.row()
         hint.enabled = False
-        hint.label(text="Fields: {cam} {tag} {collection} {index}")
+        hint.label(text="Fields: {cam} {cam_tag} {collection} {index}")
 
         if 0 <= idx < len(scene.xlr_camera_collections):
             it = scene.xlr_camera_collections[idx]
@@ -903,10 +1248,28 @@ class XLR_PT_EnvPanel(Panel):
             edit = box.box()
             edit.prop_search(it, "collection", bpy.data, "collections", text="Collection")
             edit.prop_search(it, "world", bpy.data, "worlds", text="World")
-            ui_op(edit, XLR_OT_ActivateEnv, icon="CHECKMARK")
+            edit.prop(it, "tag", text="Tag")  # env tag -> {env_tag}
+
             edit.label(text=f"Active Env Name: {_get_active_env_name(scene) or '<None>'}", icon="INFO")
+            ui_op(edit, XLR_OT_ActivateEnv, icon="CHECKMARK")
+
+            # -----------------------------
+            # Bake World
+            # -----------------------------
+
+            sub =  edit.row().grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
+
+            op = ui_op(edit, XLR_OT_BakeActiveEnvWorld, text="Bake World", icon="RENDER_STILL")
+
+            sub.prop(scene, "xlr_world_bake_resolution", text="Resolution")
+            sub.prop(scene, "xlr_world_bake_samples", text="Samples")
+
+            op.bake_resolution = scene.xlr_world_bake_resolution
+            op.bake_samples = scene.xlr_world_bake_samples
+
         else:
             box.label(text="No env selected")
+
 
 
 # =========================================================
@@ -914,17 +1277,18 @@ class XLR_PT_EnvPanel(Panel):
 # =========================================================
 
 def register():
+
     bpy.types.Scene.render_progress = FloatProperty(name="Render Progress", default=0.0, min=0.0, max=1.0)
 
     bpy.types.Scene.xlr_filename_template = StringProperty(
         name="Filename Template",
         default="{cam}_{frame:04d}",
-        description="Fields: cam, frame, tag, marker, collection, env.",
+        description="Fields: cam, frame, cam_tag, marker, collection, env, env_tag.",
     )
     bpy.types.Scene.xlr_caption_template = StringProperty(
         name="Caption Template",
-        default="{tag}",
-        description="Fields: cam, frame, tag, marker, collection, env.",
+        default="{cam_tag}",
+        description="Fields: cam, frame, cam_tag, marker, collection, env, env_tag.",
     )
 
     bpy.types.Scene.xlr_camera_collections = CollectionProperty(type=XLR_CameraCollectionItem)
@@ -933,10 +1297,25 @@ def register():
     bpy.types.Scene.xlr_envs = CollectionProperty(type=XLR_EnvItem)
     bpy.types.Scene.xlr_envs_index = IntProperty(default=0)
 
+    bpy.types.Scene.xlr_world_bake_resolution = IntProperty(
+        name="World Bake Resolution",
+        default=2048,
+        min=256,
+        max=16384,
+        )
+
+    bpy.types.Scene.xlr_world_bake_samples = IntProperty(
+        name="World Bake Samples",
+        default=4,
+        min=1,
+        max=1024,
+    )
+
+
     bpy.types.Scene.camera_rename_prefix = StringProperty(
         name="Camera Rename Prefix",
         default="{collection}_",
-        description="Fields: cam, tag, collection, index.",
+        description="Fields: cam, cam_tag, collection, index.",
     )
 
     bpy.types.Object.xlr_tag = StringProperty(
@@ -955,9 +1334,10 @@ def unregister():
     del bpy.types.Scene.xlr_camera_collections_index
     del bpy.types.Scene.xlr_envs
     del bpy.types.Scene.xlr_envs_index
+    del bpy.types.Scene.xlr_world_bake_resolution
+    del bpy.types.Scene.xlr_world_bake_samples
     del bpy.types.Scene.camera_rename_prefix
     del bpy.types.Object.xlr_tag
-
 
 if __name__ == "__main__":
     register()
