@@ -1246,29 +1246,31 @@ class XLR_PT_EnvPanel(Panel):
         if 0 <= idx < len(scene.xlr_envs):
             it = scene.xlr_envs[idx]
             edit = box.box()
-            edit.prop_search(it, "collection", bpy.data, "collections", text="Collection")
+
+            # ---- 1) Collection / World / Tag：保持三行，但尽量紧凑 ----
+            edit.prop_search(it, "collection", bpy.data, "collections", text="Col")
             edit.prop_search(it, "world", bpy.data, "worlds", text="World")
-            edit.prop(it, "tag", text="Tag")  # env tag -> {env_tag}
+            edit.prop(it, "tag", text="Tag")
 
-            edit.label(text=f"Active Env Name: {_get_active_env_name(scene) or '<None>'}", icon="INFO")
-            ui_op(edit, XLR_OT_ActivateEnv, icon="CHECKMARK")
+            # ---- 2) Active + Activate：合并到同一行 ----
+            row = edit.row(align=True)
+            #row.label(text=_get_active_env_name(scene) or "<None>", icon="INFO")
+            ui_op(row, XLR_OT_ActivateEnv, text="Activate", icon="CHECKMARK")  # 省一行/省高度
 
-            # -----------------------------
-            # Bake World
-            # -----------------------------
-
-            sub =  edit.row().grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
+            # ---- 3) Bake：参数一行 + 按钮一行（更短更稳） ----
 
             op = ui_op(edit, XLR_OT_BakeActiveEnvWorld, text="Bake World", icon="RENDER_STILL")
 
-            sub.prop(scene, "xlr_world_bake_resolution", text="Resolution")
-            sub.prop(scene, "xlr_world_bake_samples", text="Samples")
-
+            r = edit.row(align=True)
+            r.prop(scene, "xlr_world_bake_resolution", text="Resolution")
+            r.prop(scene, "xlr_world_bake_samples", text="Samples")
+            
             op.bake_resolution = scene.xlr_world_bake_resolution
             op.bake_samples = scene.xlr_world_bake_samples
 
         else:
             box.label(text="No env selected")
+
 
 
 
