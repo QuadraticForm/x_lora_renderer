@@ -132,6 +132,9 @@ def _get_marker_name(scene, frame: int) -> str:
             return m.name
     return ""
 
+def _get_current_marker_name(scene) -> str:
+    return _get_marker_name(scene, scene.frame_current)
+
 
 def _get_active_env_item(scene):
     items = getattr(scene, "xlr_envs", None)
@@ -157,35 +160,67 @@ def _get_active_env_tag(scene) -> str:
     return getattr(it, "tag", "") or ""
 
 
+def _find_first_camera_in_collection_recursive(coll: bpy.types.Collection):
+    """Depth-first, early-exit: return first camera object found, else None."""
+    if not coll:
+        return None
+    # objects first
+    for o in coll.objects:
+        if o and o.type == "CAMERA":
+            return o
+    # then children
+    for ch in coll.children:
+        hit = _find_first_camera_in_collection_recursive(ch)
+        if hit:
+            return hit
+    return None
+
+
+def _find_first_listed_camera(scene: bpy.types.Scene):
+    """Early-exit: return first camera in xlr_camera_collections list (use=True), else None."""
+    items = getattr(scene, "xlr_camera_collections", None)
+    if not items:
+        return None
+    for it in items:
+        if not getattr(it, "use", False):
+            continue
+        coll = getattr(it, "collection", None)
+        hit = _find_first_camera_in_collection_recursive(coll)
+        if hit:
+            return hit
+    return None
+
+
+def _pick_preview_camera(context):
+    obj = getattr(context, "object", None)
+    if obj and obj.type == "CAMERA":
+        return obj
+    return _find_first_listed_camera(context.scene)
+
+
+_NONE = "<NONE>"
+
 def _make_format_context(scene, cam):
-    frame = scene.frame_current
-    marker = _get_marker_name(scene, frame)
+    def _cam_field(value):
+        return value if value not in (None, "") else _NONE
 
-    env = _get_active_env_name(scene)
-    env_tag = _get_active_env_tag(scene)
+    is_cam = bool(cam) and getattr(cam, "type", None) == "CAMERA"
 
-    cam_coll = _get_primary_collection_name(cam) if cam else ""
+    cam_name = _cam_field(cam.name) if is_cam else _NONE
+    cam_tag  = _cam_field(cam.get("tag", "")) if is_cam else _NONE
+    cam_coll = _cam_field(_get_primary_collection_name(cam)) if is_cam else _NONE
 
-    if cam:
-        return {
-            "cam": cam.name,
-            "frame": frame,
-            "cam_tag": cam.get("tag", ""),
-            "marker": marker,
-            "cam_coll": cam_coll,
-            "env": env,
-            "env_tag": env_tag,
-        }
-    else:
-        return {
-            "cam": "Camera",
-            "frame": frame,
-            "cam_tag": "",
-            "marker": marker,
-            "cam_coll": "",
-            "env": env,
-            "env_tag": env_tag,
-        }
+    return {
+        "cam": cam_name,
+        "frame": scene.frame_current,
+        "cam_tag": cam_tag,
+        "marker": _get_current_marker_name(scene),
+        "cam_coll": cam_coll,
+        "env": _get_active_env_name(scene),
+        "env_tag": _get_active_env_tag(scene),
+    }
+
+
 
 
 def _make_rename_context(scene, cam, index: int):
