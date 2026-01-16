@@ -25,6 +25,39 @@ _WINDOWS_FORBIDDEN = r'[<>:"/\\|?*\x00-\x1F]'
 
 
 # =========================================================
+# Formatting (STRICT)
+# =========================================================
+
+class XLRFormatError(Exception):
+    pass
+
+
+def _format_strict(template: str, ctx: dict, *, template_name: str = "template") -> str:
+    """
+    Strict format:
+    - Unknown field -> raises XLRFormatError with clear message
+    - Any format error -> raises XLRFormatError
+    """
+    try:
+        return template.format(**ctx)
+    except KeyError as e:
+        key = e.args[0] if e.args else "<unknown>"
+        raise XLRFormatError(f"Unknown field {{{key}}} in {template_name}: {template!r}")
+    except Exception as e:
+        raise XLRFormatError(f"Format error in {template_name}: {template!r} -> {e}")
+
+
+def _format_preview(template: str, ctx: dict, *, template_name: str = "template") -> str:
+    """
+    Preview helper for UI only: never throws; returns an error string.
+    """
+    try:
+        return _format_strict(template, ctx, template_name=template_name)
+    except Exception as e:
+        return f"[FORMAT ERROR: {e}]"
+
+
+# =========================================================
 # Small Utils
 # =========================================================
 
@@ -37,6 +70,20 @@ def _sanitize_filename(name: str) -> str:
     return name or "untitled"
 
 
+def _sanitize_relpath(p: str) -> str:
+    """
+    Sanitize a relative path that may contain folders like "A/B/C".
+    - Split by both '/' and '\\'
+    - Sanitize each segment with _sanitize_filename
+    - Re-join with OS separator
+    """
+    if not p:
+        return "untitled"
+    parts = re.split(r"[\\/]+", p.strip())
+    parts = [_sanitize_filename(x) for x in parts if x.strip()]
+    return os.path.join(*parts) if parts else "untitled"
+
+
 def _resolve_output_dir(p: str) -> str:
     if not p:
         return bpy.path.abspath("//")
@@ -44,20 +91,13 @@ def _resolve_output_dir(p: str) -> str:
     return os.path.abspath(ap)
 
 
-def _safe_format(template: str, ctx: dict) -> str:
-    try:
-        return template.format(**ctx)
-    except Exception as e:
-        return f"[FORMAT ERROR: {e}]"
-
-
 def _clean_caption(s: str) -> str:
     parts = [p.strip() for p in s.split(",")]
     return ", ".join([p for p in parts if p])
 
 
-def _format_caption(template: str, ctx: dict) -> str:
-    return _clean_caption(_safe_format(template, ctx))
+def _format_caption_strict(template: str, ctx: dict) -> str:
+    return _clean_caption(_format_strict(template, ctx, template_name="Caption Template"))
 
 
 def _pick_preview_camera(context):
@@ -124,13 +164,15 @@ def _make_format_context(scene, cam):
     env = _get_active_env_name(scene)
     env_tag = _get_active_env_tag(scene)
 
+    cam_coll = _get_primary_collection_name(cam) if cam else ""
+
     if cam:
         return {
             "cam": cam.name,
             "frame": frame,
             "cam_tag": cam.get("tag", ""),
             "marker": marker,
-            "collection": _get_primary_collection_name(cam),
+            "cam_coll": cam_coll,
             "env": env,
             "env_tag": env_tag,
         }
@@ -140,17 +182,18 @@ def _make_format_context(scene, cam):
             "frame": frame,
             "cam_tag": "",
             "marker": marker,
-            "collection": "",
+            "cam_coll": "",
             "env": env,
             "env_tag": env_tag,
         }
 
 
 def _make_rename_context(scene, cam, index: int):
+    cam_coll = _get_primary_collection_name(cam) if cam else ""
     return {
         "cam": cam.name,
         "cam_tag": cam.get("tag", ""),
-        "collection": _get_primary_collection_name(cam),
+        "cam_coll": cam_coll,
         "index": index,
     }
 
@@ -185,17 +228,32 @@ def _collect_listed_cameras(scene):
     return _collect_cameras_from_collections(colls, include_children=True)
 
 
-def _rename_with_prefix(scene, cameras):
+def _rename_with_prefix(scene, cameras, reporter=None):
+    """
+    Strict rename:
+    - if prefix template has unknown field -> skip that camera (and report)
+    """
     if not cameras:
         return 0
+
+    ok_count = 0
     for i, cam in enumerate(cameras, start=1):
-        prefix = _safe_format(scene.camera_rename_prefix.strip(), _make_rename_context(scene, cam, i))
+        try:
+            prefix = _format_strict(scene.camera_rename_prefix.strip(), _make_rename_context(scene, cam, i),
+                                  template_name="Camera Rename Prefix")
+        except Exception as e:
+            if reporter:
+                reporter({"WARNING"}, f"Rename skipped for {cam.name}: {e}")
+            continue
+
         cam.name = f"{prefix}{i}"
-    return len(cameras)
+        ok_count += 1
+
+    return ok_count
 
 
 # =========================================================
-# World Bake Helpers (NEW)
+# World Bake Helpers
 # =========================================================
 
 def _remove_world_if_exists(name: str):
@@ -310,22 +368,15 @@ def _apply_collection_hide_render(scene, state, hide_all=True, keep_collection=N
 
 def _bake_world_to_env_texture(
     context,
-    * ,
+    *,
     resolution: int = 2048,
     cycles_samples: int = 4,
     file_format: str = "HDR",   # "HDR" / "OPEN_EXR" / "PNG"
 ) -> tuple[bpy.types.Image | None, str | None]:
-    """
-    Render current scene.world into an equirectangular environment image via a temporary pano camera.
-    Returns: (loaded_image_datablock, tmp_file_path_or_None)
-    - Uses unique temp file path each time.
-    - Loads with check_existing=False to avoid Blender reusing datablock by filepath.
-    """
-    scene = context.scene
 
+    scene = context.scene
     snap = _snapshot_render_settings(scene)
 
-    # Temp bake camera + collection
     bake_camera_data = bpy.data.cameras.new(".XLR_BakeCamera")
     bake_camera_data.type = "PANO"
     if hasattr(bake_camera_data, "cycles"):
@@ -341,7 +392,6 @@ def _bake_world_to_env_texture(
     scene.collection.children.link(bake_coll)
     bake_coll.objects.link(bake_camera)
 
-    # Hide all top-level collections from render (keep bake collection)
     hide_state = _snapshot_collection_hide_render(scene)
     _apply_collection_hide_render(scene, hide_state, hide_all=True, keep_collection=bake_coll)
 
@@ -349,11 +399,9 @@ def _bake_world_to_env_texture(
     loaded_img = None
 
     try:
-        # Configure render settings for bake
         scene.render.engine = "CYCLES"
         scene.camera = bake_camera
 
-        # 2:1 equirectangular size
         scene.render.resolution_x = int(resolution)
         scene.render.resolution_y = int(resolution // 2)
         scene.render.resolution_percentage = 100
@@ -368,14 +416,12 @@ def _bake_world_to_env_texture(
         if hasattr(scene, "cycles") and hasattr(scene.cycles, "samples"):
             scene.cycles.samples = int(cycles_samples)
 
-        # Render (blocking)
         bpy.ops.render.render()
 
         rr = bpy.data.images.get("Render Result")
         if rr is None:
             return None, None
 
-        # Unique temp file path (avoid overwrite + reuse)
         ext = ".hdr"
         if file_format == "OPEN_EXR":
             ext = ".exr"
@@ -386,14 +432,11 @@ def _bake_world_to_env_texture(
         tmp_path = os.path.join(tempfile.gettempdir(), tmp_name)
 
         rr.save_render(filepath=tmp_path)
-
         loaded_img = bpy.data.images.load(tmp_path, check_existing=False)
 
     finally:
-        # Restore hide_render
         _apply_collection_hide_render(scene, hide_state, hide_all=False)
 
-        # Cleanup bake objects / datablocks
         try:
             bpy.data.objects.remove(bake_camera, do_unlink=True)
         except Exception:
@@ -407,7 +450,6 @@ def _bake_world_to_env_texture(
         except Exception:
             pass
 
-        # Restore render settings
         _restore_render_settings(scene, snap)
 
     return loaded_img, tmp_path
@@ -420,7 +462,6 @@ def _build_baked_world(world_name: str, baked_img: bpy.types.Image):
     nodes = nt.nodes
     links = nt.links
 
-    # Clear nodes
     for n in list(nodes):
         nodes.remove(n)
 
@@ -444,7 +485,6 @@ def _build_baked_world(world_name: str, baked_img: bpy.types.Image):
 # =========================================================
 
 def _find_layer_collection(layer_coll: bpy.types.LayerCollection, target_coll: bpy.types.Collection):
-    """Find LayerCollection node whose .collection == target_coll."""
     if not layer_coll or not target_coll:
         return None
     if layer_coll.collection == target_coll:
@@ -457,7 +497,6 @@ def _find_layer_collection(layer_coll: bpy.types.LayerCollection, target_coll: b
 
 
 def _set_collection_exclude(view_layer: bpy.types.ViewLayer, coll: bpy.types.Collection, excluded: bool) -> bool:
-    """Set exclude on the LayerCollection corresponding to coll, if exists in this view layer."""
     if not view_layer or not coll:
         return False
     root = view_layer.layer_collection
@@ -477,11 +516,9 @@ def _activate_env(scene: bpy.types.Scene, view_layer: bpy.types.ViewLayer, env_i
     if not active.collection:
         return False
 
-    # Switch world (optional but recommended)
     if active.world:
         scene.world = active.world
 
-    # Mutually-exclusive exclude toggles: only affect env list collections.
     for i, it in enumerate(items):
         if not it.collection:
             continue
@@ -510,12 +547,6 @@ def _iter_enabled_env_indices(scene: bpy.types.Scene):
 # =========================================================
 
 def ui_op(layout, op_cls, *, text=None, icon="NONE", **props):
-    """
-    Draw an operator button using the operator class.
-    - Uses op_cls.bl_idname automatically.
-    - If text is None, uses op_cls.bl_label.
-    - You can pass operator properties via **props.
-    """
     if text is None:
         text = getattr(op_cls, "bl_label", "")
     op = layout.operator(op_cls.bl_idname, text=text, icon=icon)
@@ -581,12 +612,11 @@ class XLR_OT_GenerateCaptions(Operator):
 
         env_indices = _iter_enabled_env_indices(scene)
         if not env_indices:
-            env_indices = [-1]  # fallback: single env (no activation)
+            env_indices = [-1]
 
         orig_frame = scene.frame_current
         orig_world = scene.world
 
-        # store original excludes for env collections (only those listed)
         orig_excludes = {}
         if getattr(scene, "xlr_envs", None):
             for it in scene.xlr_envs:
@@ -596,8 +626,10 @@ class XLR_OT_GenerateCaptions(Operator):
                 if lc:
                     orig_excludes[it.collection.name_full] = lc.exclude
 
+        skipped = 0
+        wrote = 0
+
         try:
-            # env -> frame -> camera
             for env_i in env_indices:
                 if env_i >= 0:
                     ok = _activate_env(scene, view_layer, env_i)
@@ -610,20 +642,35 @@ class XLR_OT_GenerateCaptions(Operator):
                     for cam in cams:
                         ctx = _make_format_context(scene, cam)
 
-                        filename = _sanitize_filename(_safe_format(scene.xlr_filename_template.strip(), ctx))
+                        # strict filename
+                        try:
+                            raw_name = _format_strict(scene.xlr_filename_template.strip(), ctx,
+                                                      template_name="Filename Template")
+                        except Exception as e:
+                            skipped += 1
+                            self.report({"WARNING"}, f"Skip caption (filename template error): {e}")
+                            continue
+
+                        filename = _sanitize_relpath(raw_name)
                         txt_path = os.path.join(out_dir, f"{filename}.txt")
-                        caption = _format_caption(scene.xlr_caption_template, ctx)
+
+                        # strict caption
+                        try:
+                            caption = _format_caption_strict(scene.xlr_caption_template, ctx)
+                        except Exception as e:
+                            skipped += 1
+                            self.report({"WARNING"}, f"Skip caption (caption template error): {e}")
+                            continue
 
                         _ensure_dir(txt_path)
                         with open(txt_path, "w", encoding="utf-8") as f:
                             f.write(caption)
+                        wrote += 1
 
         finally:
-            # restore state
             scene.frame_set(orig_frame)
             scene.world = orig_world
 
-            # restore excludes (only env list collections)
             if getattr(scene, "xlr_envs", None):
                 for it in scene.xlr_envs:
                     if not it.collection:
@@ -635,7 +682,7 @@ class XLR_OT_GenerateCaptions(Operator):
                     if key in orig_excludes:
                         lc.exclude = orig_excludes[key]
 
-        self.report({"INFO"}, f"Captions generated to: {out_dir}")
+        self.report({"INFO"}, f"Captions: wrote {wrote}, skipped {skipped}. Output: {out_dir}")
         return {"FINISHED"}
 
 
@@ -650,34 +697,28 @@ class XLR_OT_RenderAllCameras(Operator):
         self.scene = context.scene
         self.view_layer = context.view_layer
 
-        # cameras
         self.cameras = _collect_listed_cameras(self.scene)
         if not self.cameras:
             self.report({"WARNING"}, "No cameras found in listed collections")
             return {"CANCELLED"}
 
-        # envs (enabled)
         self.env_indices = _iter_enabled_env_indices(self.scene)
         if not self.env_indices:
-            self.env_indices = [-1]  # fallback: single env (no activation)
+            self.env_indices = [-1]
 
-        # frames
         self.frames = list(range(self.scene.frame_start, self.scene.frame_end + 1))
         if not self.frames:
             self.report({"WARNING"}, "Invalid frame range")
             return {"CANCELLED"}
 
-        # iteration state: env -> frame -> camera
         self.env_i = 0
         self.frame_i = 0
         self.cam_i = 0
 
-        # backup original state
         self.original_camera = self.scene.camera
         self.original_render_filepath = self.scene.render.filepath
         self.original_world = self.scene.world
 
-        # store original excludes for env collections (only those listed)
         self.original_excludes = {}
         if getattr(self.scene, "xlr_envs", None):
             for it in self.scene.xlr_envs:
@@ -687,7 +728,9 @@ class XLR_OT_RenderAllCameras(Operator):
                 if lc:
                     self.original_excludes[it.collection.name_full] = lc.exclude
 
-        # activate initial env (if any) and set initial frame
+        self.skipped = 0
+        self.rendered = 0
+
         self._ensure_env_active()
         self.scene.frame_set(self.frames[self.frame_i])
 
@@ -697,7 +740,6 @@ class XLR_OT_RenderAllCameras(Operator):
         return {"RUNNING_MODAL"}
 
     def _ensure_env_active(self):
-        """Activate current env index (switch world + exclude env collections)."""
         if self.env_i >= len(self.env_indices):
             return
         env_idx = self.env_indices[self.env_i]
@@ -707,31 +749,7 @@ class XLR_OT_RenderAllCameras(Operator):
     def _is_done(self) -> bool:
         return self.env_i >= len(self.env_indices)
 
-    def step(self):
-        if self._is_done():
-            return
-
-        scene = self.scene
-
-        # ensure current env is active
-        self._ensure_env_active()
-
-        frame = self.frames[self.frame_i]
-        cam = self.cameras[self.cam_i]
-
-        scene.frame_set(frame)
-
-        # build output
-        ctx = _make_format_context(scene, cam)
-        filename = _sanitize_filename(_safe_format(scene.xlr_filename_template.strip(), ctx))
-        filepath = os.path.join(_resolve_output_dir(self.original_render_filepath), filename)
-
-        # render
-        scene.camera = cam
-        scene.render.filepath = filepath
-        bpy.ops.render.render("INVOKE_DEFAULT", write_still=True, use_viewport=False)
-
-        # advance: camera -> frame -> env
+    def _advance(self):
         self.cam_i += 1
         if self.cam_i >= len(self.cameras):
             self.cam_i = 0
@@ -740,14 +758,45 @@ class XLR_OT_RenderAllCameras(Operator):
                 self.frame_i = 0
                 self.env_i += 1
 
-        # progress (env outer, frame middle, cam inner)
         total = len(self.env_indices) * len(self.frames) * len(self.cameras)
         done = (
             (self.env_i * len(self.frames) * len(self.cameras)) +
             (self.frame_i * len(self.cameras)) +
             self.cam_i
         )
-        scene.render_progress = min(max(done / total, 0.0), 1.0) if total > 0 else 0.0
+        self.scene.render_progress = min(max(done / total, 0.0), 1.0) if total > 0 else 0.0
+
+    def step(self):
+        if self._is_done():
+            return
+
+        scene = self.scene
+        self._ensure_env_active()
+
+        frame = self.frames[self.frame_i]
+        cam = self.cameras[self.cam_i]
+
+        scene.frame_set(frame)
+        ctx = _make_format_context(scene, cam)
+
+        # strict filename
+        try:
+            raw_name = _format_strict(scene.xlr_filename_template.strip(), ctx, template_name="Filename Template")
+        except Exception as e:
+            self.skipped += 1
+            self.report({"WARNING"}, f"Skip render (filename template error): {e}")
+            self._advance()
+            return
+
+        filename = _sanitize_relpath(raw_name)
+        filepath = os.path.join(_resolve_output_dir(self.original_render_filepath), filename)
+
+        scene.camera = cam
+        scene.render.filepath = filepath
+        bpy.ops.render.render("INVOKE_DEFAULT", write_still=True, use_viewport=False)
+        self.rendered += 1
+
+        self._advance()
 
     def modal(self, context, event):
         scene = context.scene
@@ -755,7 +804,7 @@ class XLR_OT_RenderAllCameras(Operator):
         if self._is_done():
             self.finish(context)
             scene.render_progress = 0.0
-            self.report({"INFO"}, "Rendering completed")
+            self.report({"INFO"}, f"Rendering completed. Rendered {self.rendered}, skipped {self.skipped}.")
             return {"FINISHED"}
 
         if event.type == "TIMER":
@@ -764,7 +813,7 @@ class XLR_OT_RenderAllCameras(Operator):
         if event.type == "ESC":
             self.finish(context)
             scene.render_progress = 0.0
-            self.report({"INFO"}, "Rendering cancelled")
+            self.report({"INFO"}, f"Rendering cancelled. Rendered {self.rendered}, skipped {self.skipped}.")
             return {"CANCELLED"}
 
         return {"PASS_THROUGH"}
@@ -772,12 +821,10 @@ class XLR_OT_RenderAllCameras(Operator):
     def finish(self, context):
         scene = context.scene
 
-        # restore state
         scene.camera = self.original_camera
         scene.render.filepath = self.original_render_filepath
         scene.world = self.original_world
 
-        # restore excludes (only env list collections)
         if getattr(scene, "xlr_envs", None):
             for it in scene.xlr_envs:
                 if not it.collection:
@@ -789,7 +836,6 @@ class XLR_OT_RenderAllCameras(Operator):
                 if key in self.original_excludes:
                     lc.exclude = self.original_excludes[key]
 
-        # remove timer
         wm = context.window_manager
         if self._timer:
             wm.event_timer_remove(self._timer)
@@ -802,7 +848,6 @@ class XLR_OT_AddCameraCollection(Operator):
 
     def execute(self, context):
         scene = context.scene
-
         active_lc = getattr(context.view_layer, "active_layer_collection", None)
         active_coll = active_lc.collection if active_lc else None
 
@@ -858,8 +903,8 @@ class XLR_OT_AddEnv(Operator):
         item = scene.xlr_envs.add()
         item.use = True
         item.collection = active_coll
-        item.world = scene.world  # convenient default
-        item.tag = ""             # default empty; user can set
+        item.world = scene.world
+        item.tag = ""
 
         scene.xlr_envs_index = max(0, len(scene.xlr_envs) - 1)
         return {"FINISHED"}
@@ -925,9 +970,9 @@ class XLR_OT_RenameAllCameras(Operator):
 
     def execute(self, context):
         scene = context.scene
-        n = _rename_with_prefix(scene, _collect_listed_cameras(scene))
+        n = _rename_with_prefix(scene, _collect_listed_cameras(scene), reporter=self.report)
         if n == 0:
-            self.report({"WARNING"}, "No cameras found in listed collections")
+            self.report({"WARNING"}, "No cameras renamed (or none found)")
             return {"CANCELLED"}
         self.report({"INFO"}, f"Renamed {n} cameras")
         return {"FINISHED"}
@@ -950,9 +995,9 @@ class XLR_OT_RenameInActiveCollection(Operator):
             self.report({"WARNING"}, "Active item has no collection set")
             return {"CANCELLED"}
 
-        n = _rename_with_prefix(scene, _collect_cameras_from_collections([coll], include_children=True))
+        n = _rename_with_prefix(scene, _collect_cameras_from_collections([coll], include_children=True), reporter=self.report)
         if n == 0:
-            self.report({"WARNING"}, f"No cameras found in: {coll.name}")
+            self.report({"WARNING"}, f"No cameras renamed in: {coll.name}")
             return {"CANCELLED"}
 
         self.report({"INFO"}, f"Renamed {n} cameras in: {coll.name}")
@@ -976,7 +1021,6 @@ class XLR_OT_BakeActiveEnvWorld(Operator):
             self.report({"WARNING"}, "No env selected")
             return {"CANCELLED"}
 
-        # 1) Bake 前先 activate 当前 env（避免歧义）
         if not _activate_env(scene, view_layer, idx):
             self.report({"WARNING"}, "Env activation failed (need collection)")
             return {"CANCELLED"}
@@ -987,19 +1031,16 @@ class XLR_OT_BakeActiveEnvWorld(Operator):
             return {"CANCELLED"}
 
         env_name = _get_active_env_name(scene) or (it.collection.name if it.collection else "Env")
-        baked_name = f"{env_name}_world_baked"  # required naming
+        baked_name = f"{env_name}_world_baked"
 
-        # 2) remove same-name datablocks first (short remove, do_unlink)
         _remove_world_if_exists(baked_name)
         _remove_image_if_exists(baked_name)
 
-        # 3) disable local cameras to avoid wrong render camera
         local_cam_token = _disable_local_cameras_in_window(context)
 
         img = None
         tmp_path = None
         try:
-            # 4) bake -> temp file -> load as new image datablock
             img, tmp_path = _bake_world_to_env_texture(
                 context,
                 resolution=self.bake_resolution,
@@ -1013,10 +1054,8 @@ class XLR_OT_BakeActiveEnvWorld(Operator):
             self.report({"WARNING"}, "Bake failed (no image)")
             return {"CANCELLED"}
 
-        # 5) rename image to stable baked name
         img.name = baked_name
 
-        # 6) pack + clear filepath (avoid later “match by path”)
         try:
             img.pack()
         except Exception:
@@ -1028,17 +1067,13 @@ class XLR_OT_BakeActiveEnvWorld(Operator):
                 except Exception:
                     pass
 
-        # delete temp file after pack
         if tmp_path and os.path.isfile(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
 
-        # 7) create baked world and wire nodes
         baked_world = _build_baked_world(baked_name, img)
-
-        # 8) apply baked world to env item + scene
         it.world = baked_world
         scene.world = baked_world
 
@@ -1079,11 +1114,11 @@ class XLR_PT_FilePanel(Panel):
         box.prop(scene, "xlr_filename_template", text="Filename")
         hint = box.row()
         hint.enabled = False
-        hint.label(text="Fields: {cam} {frame} {cam_tag} {marker} {collection} {env} {env_tag}")
+        hint.label(text="Fields: {cam} {frame} {cam_tag} {marker} {cam_coll} {env} {env_tag}")
 
         cam = _pick_preview_camera(context)
         box.label(
-            text=f"Preview: {_safe_format(scene.xlr_filename_template, _make_format_context(scene, cam))}",
+            text=f"Preview: {_format_preview(scene.xlr_filename_template, _make_format_context(scene, cam), template_name='Filename Template')}",
             icon="INFO"
         )
 
@@ -1103,13 +1138,12 @@ class XLR_PT_CaptionPanel(Panel):
 
         hint = box.row()
         hint.enabled = False
-        hint.label(text="Fields: {cam} {frame} {cam_tag} {marker} {collection} {env} {env_tag}")
+        hint.label(text="Fields: {cam} {frame} {cam_tag} {marker} {cam_coll} {env} {env_tag}")
 
         cam = _pick_preview_camera(context)
-        box.label(
-            text=f"Preview: {_format_caption(scene.xlr_caption_template, _make_format_context(scene, cam))}",
-            icon="INFO"
-        )
+        # preview = strict format then clean caption for display
+        raw = _format_preview(scene.xlr_caption_template, _make_format_context(scene, cam), template_name="Caption Template")
+        box.label(text=f"Preview: {_clean_caption(raw)}", icon="INFO")
 
         layout.separator()
         ui_op(layout, XLR_OT_GenerateCaptions, icon="FILE_TEXT")
@@ -1191,21 +1225,21 @@ class XLR_PT_CameraPanel(Panel):
 
         box = layout.box()
         cam_name = obj.name if (obj and obj.type == "CAMERA") else "NONE"
-        box.label(text=f"Selected Camera: {cam_name}")
+        box.label(text=f"Selected: {cam_name}")
         if obj and obj.type == "CAMERA":
-            box.prop(obj, "xlr_tag", text="Tag")  # still edits Object["tag"]
+            box.prop(obj, "xlr_tag", text="Tag")
         else:
-            box.label(text="No camera selected")
+            box.label(text="No Tag (select a camera)")
 
         layout.separator()
 
         box = layout.box()
-        box.label(text="Camera Renaming")
+        box.label(text="Renaming")
         box.prop(scene, "camera_rename_prefix", text="prefix")
 
         hint = box.row()
         hint.enabled = False
-        hint.label(text="Fields: {cam} {cam_tag} {collection} {index}")
+        hint.label(text="Fields: {cam} {cam_tag} {cam_coll} {index}")
 
         if 0 <= idx < len(scene.xlr_camera_collections):
             it = scene.xlr_camera_collections[idx]
@@ -1247,24 +1281,19 @@ class XLR_PT_EnvPanel(Panel):
             it = scene.xlr_envs[idx]
             edit = box.box()
 
-            # ---- 1) Collection / World / Tag：保持三行，但尽量紧凑 ----
             edit.prop_search(it, "collection", bpy.data, "collections", text="Col")
             edit.prop_search(it, "world", bpy.data, "worlds", text="World")
             edit.prop(it, "tag", text="Tag")
 
-            # ---- 2) Active + Activate：合并到同一行 ----
             row = edit.row(align=True)
-            #row.label(text=_get_active_env_name(scene) or "<None>", icon="INFO")
-            ui_op(row, XLR_OT_ActivateEnv, text="Activate", icon="CHECKMARK")  # 省一行/省高度
-
-            # ---- 3) Bake：参数一行 + 按钮一行（更短更稳） ----
+            ui_op(row, XLR_OT_ActivateEnv, text="Activate", icon="CHECKMARK")
 
             op = ui_op(edit, XLR_OT_BakeActiveEnvWorld, text="Bake World", icon="RENDER_STILL")
 
             r = edit.row(align=True)
             r.prop(scene, "xlr_world_bake_resolution", text="Resolution")
             r.prop(scene, "xlr_world_bake_samples", text="Samples")
-            
+
             op.bake_resolution = scene.xlr_world_bake_resolution
             op.bake_samples = scene.xlr_world_bake_samples
 
@@ -1272,25 +1301,22 @@ class XLR_PT_EnvPanel(Panel):
             box.label(text="No env selected")
 
 
-
-
 # =========================================================
-# Register / Unregister
+# Register / Unregister (types are your responsibility; props are mine)
 # =========================================================
 
 def register():
-
     bpy.types.Scene.render_progress = FloatProperty(name="Render Progress", default=0.0, min=0.0, max=1.0)
 
     bpy.types.Scene.xlr_filename_template = StringProperty(
         name="Filename Template",
-        default="{cam}_{frame:04d}",
-        description="Fields: cam, frame, cam_tag, marker, collection, env, env_tag.",
+        default="{cam_coll}/{env}_{cam}_{frame:04d}",
+        description="Fields: cam, frame, cam_tag, marker, cam_coll, env, env_tag.",
     )
     bpy.types.Scene.xlr_caption_template = StringProperty(
         name="Caption Template",
         default="{cam_tag}",
-        description="Fields: cam, frame, cam_tag, marker, collection, env, env_tag.",
+        description="Fields: cam, frame, cam_tag, marker, cam_coll, env, env_tag.",
     )
 
     bpy.types.Scene.xlr_camera_collections = CollectionProperty(type=XLR_CameraCollectionItem)
@@ -1304,7 +1330,7 @@ def register():
         default=2048,
         min=256,
         max=16384,
-        )
+    )
 
     bpy.types.Scene.xlr_world_bake_samples = IntProperty(
         name="World Bake Samples",
@@ -1313,11 +1339,10 @@ def register():
         max=1024,
     )
 
-
     bpy.types.Scene.camera_rename_prefix = StringProperty(
         name="Camera Rename Prefix",
-        default="{collection}_",
-        description="Fields: cam, cam_tag, collection, index.",
+        default="{cam_coll}_",
+        description="Fields: cam, cam_tag, cam_coll, index.",
     )
 
     bpy.types.Object.xlr_tag = StringProperty(
@@ -1340,6 +1365,7 @@ def unregister():
     del bpy.types.Scene.xlr_world_bake_samples
     del bpy.types.Scene.camera_rename_prefix
     del bpy.types.Object.xlr_tag
+
 
 if __name__ == "__main__":
     register()
