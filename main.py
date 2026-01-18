@@ -796,6 +796,9 @@ class XLR_OT_RenderAllCameras(Operator):
         self.skipped = 0
         self.rendered = 0
 
+        # NEW: disable local cameras for the whole modal render session
+        self._local_cam_token = _disable_local_cameras_in_window(context)
+
         self._ensure_env_active()
         self.scene.frame_set(self.frames[self.frame_i])
 
@@ -858,7 +861,7 @@ class XLR_OT_RenderAllCameras(Operator):
 
         scene.camera = cam
         scene.render.filepath = filepath
-        bpy.ops.render.render("INVOKE_DEFAULT", write_still=True, use_viewport=False)
+        bpy.ops.render.render(write_still=True, use_viewport=False)
         self.rendered += 1
 
         self._advance()
@@ -889,6 +892,10 @@ class XLR_OT_RenderAllCameras(Operator):
         scene.camera = self.original_camera
         scene.render.filepath = self.original_render_filepath
         scene.world = self.original_world
+
+        # NEW: restore local cameras (even if token is empty, it's fine)
+        _restore_local_cameras(getattr(self, "_local_cam_token", []))
+        self._local_cam_token = []
 
         if getattr(scene, "xlr_envs", None):
             for it in scene.xlr_envs:
