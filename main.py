@@ -263,28 +263,58 @@ def _collect_listed_cameras(scene):
     return _collect_cameras_from_collections(colls, include_children=True)
 
 
-def _rename_with_prefix(scene, cameras, reporter=None):
+def _rename_with_prefix(scene, cameras, reporter=None) -> int:
     """
-    Strict rename:
-    - if prefix template has unknown field -> skip that camera (and report)
+    Two-pass strict rename:
+    1) temp UUID names to avoid collisions
+    2) (cam_id, name_id) loop: if Blender auto-suffixes -> bump name_id and retry same cam
+    Any format error -> abort and restore original names.
     """
     if not cameras:
         return 0
 
-    ok_count = 0
-    for i, cam in enumerate(cameras, start=1):
-        try:
-            prefix = _format_strict(scene.camera_rename_prefix.strip(), _make_rename_context(scene, cam, i),
-                                  template_name="Camera Rename Prefix")
-        except Exception as e:
-            if reporter:
-                reporter({"WARNING"}, f"Rename skipped for {cam.name}: {e}")
-            continue
+    template = (scene.camera_rename_prefix or "").strip()
+    original_names = {cam: cam.name for cam in cameras}
 
-        cam.name = f"{prefix}{i}"
-        ok_count += 1
+    try:
+        # pass 1: temp UUID names
+        for cam in cameras:
+            cam.name = f".XLR_TMP_{uuid.uuid4().hex}"
 
-    return ok_count
+        # pass 2: bump-retry
+        cam_id = 0
+        name_id = 1
+
+        # safety: avoid infinite loop on pathological templates
+        max_name_id = 100000
+
+        while cam_id < len(cameras):
+            if name_id > max_name_id:
+                raise RuntimeError("too many retries (name_id exploded)")
+
+            cam = cameras[cam_id]
+            prefix = template.format(**_make_rename_context(scene, cam, name_id))
+            wanted = f"{prefix}{name_id}"
+
+            cam.name = wanted
+            if cam.name == wanted:
+                cam_id += 1
+                name_id += 1
+            else:
+                name_id += 1
+
+        return len(cameras)
+
+    except Exception as e:
+        for cam, nm in original_names.items():
+            try:
+                cam.name = nm
+            except Exception:
+                pass
+        if reporter:
+            reporter({"ERROR"}, f"Rename failed, restored original names: {e}")
+        return 0
+
 
 
 # =========================================================
